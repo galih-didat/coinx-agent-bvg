@@ -83,7 +83,7 @@
     Apply and verify without restarting.
 
 .NOTES
-    Version : v2.2
+    Version : v2.3
     Exit    : 0 all items compliant, 1 one or more items non-compliant, 2 not elevated / elevation declined
 
     Change history
@@ -94,6 +94,7 @@
     | 2.0     | 2026-11-18 | Restart is now the default (-NoRestart to skip); self-elevation for curl-and-run use; re-enable suppressed update notifications for all user profiles |
     | 2.1     | 2026-11-18 | Restart immediately after the script finishes (default delay 0, forced); restart is issued after the log is closed |
     | 2.2     | 2026-11-18 | Add automatic download and scheduled install outside working hours (AUOptions=4, -InstallHour, optional -WakeToInstall) |
+    | 2.3     | 2026-11-18 | Fix: reg.exe unload Access Denied aborted the run; load/unload now use exit codes, unload retries with GC and no longer throws, stale HW_ hives are reused |
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -283,6 +284,34 @@ function Get-NotificationSuppressions {
     return $hits.ToArray()
 }
 
+# Runs reg.exe and returns its exit code. Native stderr is not merged into the error stream here,
+# because under $ErrorActionPreference = 'Stop' Windows PowerShell 5.1 turns merged stderr into a terminating error.
+function Invoke-Reg {
+    param([string[]]$Arguments)
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $null = & reg.exe @Arguments 2>&1
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $old
+    }
+}
+
+# Unloads a hive mounted under HKU. Open registry handles (PowerShell objects not yet collected,
+# antivirus/EDR scans) make the first attempts fail with Access Denied, so retry with GC. Never throws.
+function Dismount-UserHive {
+    param([string]$Name)
+    for ($i = 1; $i -le 10; $i++) {
+        [gc]::Collect()
+        [gc]::WaitForPendingFinalizers()
+        if ((Invoke-Reg @('unload', "HKU\$Name")) -eq 0) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    Write-Warning "Could not unload HKU\$Name (a handle is still open). It is released at the next restart. Re-running the script is safe."
+    return $false
+}
+
 # Runs $Action once per local user profile hive (loaded ones directly, offline ones via reg load/unload).
 function Invoke-ForEachUserHive {
     param([scriptblock]$Action)
@@ -303,13 +332,17 @@ function Invoke-ForEachUserHive {
         $dat = Join-Path $p.LocalPath 'NTUSER.DAT'
         if (-not (Test-Path -LiteralPath $dat)) { continue }
         $tmp = "HW_$($p.SID)"
-        & reg.exe load "HKU\$tmp" $dat 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Warning "Could not load hive for $($p.SID), skipped."; continue }
+        # A hive left mounted by an earlier failed run is reused instead of loaded twice
+        if (-not (Test-Path -LiteralPath "Registry::HKEY_USERS\$tmp")) {
+            if ((Invoke-Reg @('load', "HKU\$tmp", $dat)) -ne 0) {
+                Write-Warning "Could not load hive for $($p.SID) (file in use?), skipped."
+                continue
+            }
+        }
         try {
             & $Action "Registry::HKEY_USERS\$tmp" $p.SID
         } finally {
-            [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-            & reg.exe unload "HKU\$tmp" 2>&1 | Out-Null
+            [void](Dismount-UserHive -Name $tmp)
         }
     }
 }
