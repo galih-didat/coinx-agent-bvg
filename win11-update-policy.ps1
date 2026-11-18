@@ -11,7 +11,8 @@
         powershell -ExecutionPolicy Bypass -File $env:TEMP\Harden-WindowsUpdate.ps1
 
     Default behavior: self-elevate (UAC prompt if needed), apply, verify, then restart the computer
-    after a 60 second countdown (cancel with: shutdown /a). Use -NoRestart to skip the restart.
+    immediately once the script finishes (running applications are closed without warning, unsaved
+    work is lost). Use -NoRestart to skip the restart.
 
     Applied settings (one table drives both apply and verify, so they cannot drift):
       1. Receive updates for other Microsoft products : enabled (registry + Microsoft Update registration)
@@ -25,13 +26,17 @@
       E. Enforcement                                  : compliance deadlines with auto-restart, blockers removed
          (NoAutoUpdate, NoAutoRebootWithLoggedOnUsers, Windows Update access disabled).
 
-    Not touched: AUOptions (update install schedule), Focus assist / Do Not Disturb state.
+      A. Automatic install                            : AUOptions=4 (auto download and scheduled install), every day
+         at -InstallHour (default 22:00, outside working hours).
+
+    Not touched: Focus assist / Do Not Disturb state.
 
 .PARAMETER NoRestart
     Do not restart after the run. Without this switch the computer restarts when every item passes.
 
 .PARAMETER RestartDelaySeconds
-    Countdown before the restart (0-3600). Default 60.
+    Countdown before the restart (0-3600). Default 0 (restart immediately). A value above 0 can be
+    cancelled during the countdown with: shutdown /a
 
 .PARAMETER QualityDeadlineDays
     Days from update offer to forced install for quality updates (0-30). Default 2.
@@ -48,6 +53,14 @@
 .PARAMETER SkipDeadlines
     Skip the compliance deadline policies.
 
+.PARAMETER InstallHour
+    Hour of day (0-23, local time) when scheduled automatic install runs. Default 22 (22:00).
+    Pick an hour outside working hours. Applies every day.
+
+.PARAMETER WakeToInstall
+    Also lets Windows Update wake the computer from sleep to install scheduled updates (AUPowerManagement).
+    Off by default because it changes power behavior.
+
 .PARAMETER VerifyOnly
     Only read and report the current state. Changes nothing, never restarts.
 
@@ -63,14 +76,14 @@
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Harden-WindowsUpdate.ps1
-    Apply, verify, restart after 60 seconds.
+    Apply, verify, restart immediately.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Harden-WindowsUpdate.ps1 -NoRestart
     Apply and verify without restarting.
 
 .NOTES
-    Version : v2.0
+    Version : v2.2
     Exit    : 0 all items compliant, 1 one or more items non-compliant, 2 not elevated / elevation declined
 
     Change history
@@ -79,15 +92,19 @@
     | 1.0     | 2026-11-18 | Initial release |
     | 1.1     | 2026-11-18 | Add -Restart and -RestartDelaySeconds |
     | 2.0     | 2026-11-18 | Restart is now the default (-NoRestart to skip); self-elevation for curl-and-run use; re-enable suppressed update notifications for all user profiles |
+    | 2.1     | 2026-11-18 | Restart immediately after the script finishes (default delay 0, forced); restart is issued after the log is closed |
+    | 2.2     | 2026-11-18 | Add automatic download and scheduled install outside working hours (AUOptions=4, -InstallHour, optional -WakeToInstall) |
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [switch]$NoRestart,
-    [ValidateRange(0, 3600)][int]$RestartDelaySeconds = 60,
+    [ValidateRange(0, 3600)][int]$RestartDelaySeconds = 0,
     [ValidateRange(0, 30)][int]$QualityDeadlineDays = 2,
     [ValidateRange(0, 30)][int]$FeatureDeadlineDays = 7,
     [ValidateRange(0, 7)][int]$GracePeriodDays = 1,
     [switch]$EnableLatestUpdates,
+    [ValidateRange(0, 23)][int]$InstallHour = 22,
+    [switch]$WakeToInstall,
     [switch]$SkipDeadlines,
     [switch]$VerifyOnly,
     [string]$BackupPath = (Join-Path $env:ProgramData 'WinUpdateHardening'),
@@ -170,6 +187,16 @@ Add-Check '5 Active hours auto' $UX 'SmartActiveHoursState' 1
 Add-Check '5 Active hours auto' $WU 'SetActiveHours'   $null 'Remove'
 Add-Check '5 Active hours auto' $WU 'ActiveHoursStart' $null 'Remove'
 Add-Check '5 Active hours auto' $WU 'ActiveHoursEnd'   $null 'Remove'
+
+# A. Automatic download and scheduled install outside working hours
+#    AUOptions 4 = auto download and schedule the install; ScheduledInstallDay 0 = every day
+Add-Check 'A Auto install' $AU 'NoAutoUpdate' 0
+Add-Check 'A Auto install' $AU 'AUOptions' 4
+Add-Check 'A Auto install' $AU 'ScheduledInstallDay' 0
+Add-Check 'A Auto install' $AU 'ScheduledInstallTime' $InstallHour
+if ($WakeToInstall) {
+    Add-Check 'A Auto install' $AU 'AUPowerManagement' 1
+}
 
 # N. Update notifications: remove machine-wide suppression
 Add-Check 'N Notifications' $WU 'SetUpdateNotificationLevel' $null 'Remove'
@@ -413,9 +440,8 @@ try {
         if ($fail -gt 0) {
             Write-Warning 'Restart skipped: one or more items FAILED. Fix them first.'
         } else {
-            Write-Host "Restarting in $RestartDelaySeconds seconds. Cancel with: shutdown /a"
-            & shutdown.exe /r /t $RestartDelaySeconds /c "Windows Update hardening applied. Restarting to finish." /d p:2:17
             $script:restartScheduled = $true
+            Write-Host 'Restarting now (log is closed first).'
         }
     }
 }
@@ -423,9 +449,12 @@ finally {
     Stop-Transcript | Out-Null
 }
 
-# Keep the elevated window readable when the script relaunched itself
-if ($Relaunched) {
-    if ($script:restartScheduled) { Start-Sleep -Seconds 10 }
-    else { Read-Host 'Press Enter to close' | Out-Null }
+# Restart is issued after the transcript is closed so the log is complete.
+# /f forces running applications to close, otherwise an app with unsaved data can block a /t 0 restart.
+if ($script:restartScheduled) {
+    & shutdown.exe /r /f /t $RestartDelaySeconds /c "Windows Update hardening applied. Restarting to finish." /d p:2:17
+} elseif ($Relaunched) {
+    # Keep the elevated window readable when the script relaunched itself and no restart follows
+    Read-Host 'Press Enter to close' | Out-Null
 }
 if ($null -ne $script:exitCode) { exit $script:exitCode }
